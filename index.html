@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NeuroQuest: The Lost Temple</title>
+    <!-- Load Tailwind CSS for UI and Three.js for 3D graphics -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: 'Inter', sans-serif; background-color: #140d0a; }
+        canvas { display: block; }
+        /* Style for the Score/Message overlay */
+        #ui-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            pointer-events: none;
+        }
+        .ui-panel {
+            background-color: rgba(0, 0, 0, 0.7);
+            border-radius: 8px;
+            padding: 10px 20px;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.5);
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui-overlay" class="p-6 flex justify-between items-start">
+        <div id="score-counter" class="ui-panel text-white text-lg font-bold">
+            Score: 0 / 5
+        </div>
+        <div id="message-box" class="ui-panel bg-yellow-800 text-white text-3xl font-extrabold hidden transition duration-500 ease-in-out transform scale-100">
+            <!-- Game messages go here -->
+        </div>
+    </div>
+
+    <div class="absolute bottom-4 left-1/2 transform -translate-x-1/2 text-white bg-black bg-opacity-70 p-2 rounded-lg text-sm shadow-xl">
+        Controls: **↑↓←→** Movement | **E** Pick up Treasure | **P** Mark Cell
+    </div>
+
+    <script>
+        // Set up global environment variables for Firebase (required in canvas environment)
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        // Note: No Firebase is needed for this simple single-player game, but these variables are included for compliance.
+
+        // --- Game Setup Constants ---
+        const CELL_SIZE = 10;
+        const PLAYER_HEIGHT = 1.8;
+        const ROTATION_SPEED = 0.05;
+        const MOVEMENT_SPEED = 0.2;
+        // CHANGED: Increased the interaction distance for easier, more forgiving treasure collection
+        const INTERACTION_DISTANCE = 3.0;
+
+        // --- Game State and Engine Variables ---
+        let scene, camera, renderer;
+        const raycaster = new THREE.Raycaster();
+
+        // The 'keyboard' map is no longer used for movement/rotation,
+        // but kept for tracking other single-press action keys (like 'E' or 'P').
+        const keyboard = {};
+
+        const player = {
+            mesh: null,
+            // Start at (1, 1) cell center
+            position: new THREE.Vector3(1 * CELL_SIZE + CELL_SIZE / 2, PLAYER_HEIGHT, 1 * CELL_SIZE + CELL_SIZE / 2),
+            rotationY: 0,
+            velocity: new THREE.Vector3(),
+            // NEW: Input intent trackers (modular input for BCI)
+            moveDirection: 0, // 1 for forward, -1 for backward, 0 for stop
+            rotateDirection: 0, // 1 for right, -1 for left, 0 for stop
+        };
+
+        let score = 0;
+        const maxScore = 5;
+        let isGameOver = false;
+
+        // NEW FEATURE: Maze marking/painting state
+        let PAINTED_GRID = [];
+        const PAINTED_MARKERS = [];
+
+        // --- DOM Elements ---
+        const scoreCounter = document.getElementById('score-counter');
+        const messageBox = document.getElementById('message-box');
+
+        // --- Maze Definition (Grid Map) ---
+        // 0: Floor (potential treasure spot), 1: Wall
+        const MAZE = [
+            // X=0  1  2  3  4  5  6  7  8  9  <-- X Coordinates
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1], // Z=0
+            [1, 0, 0, 0, 0, 0, 0, 0, 0, 1], // Z=1
+            [1, 0, 1, 1, 0, 0, 0, 1, 0, 1], // Z=2
+            [1, 0, 1, 0, 0, 0, 0, 1, 0, 1], // Z=3
+            [1, 0, 0, 0, 0, 0, 1, 1, 0, 1], // Z=4
+            [1, 0, 0, 0, 0, 0, 0, 0, 0, 1], // Z=5
+            [1, 0, 1, 1, 1, 0, 1, 1, 0, 1], // Z=6
+            [1, 0, 0, 0, 0, 0, 0, 1, 0, 1], // Z=7
+            [1, 0, 1, 0, 1, 0, 0, 0, 0, 1], // Z=8
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]  // Z=9
+        ];
+        const WALLS = [];
+        const TREASURES = [];
+
+
+        // --- Utility Function for Randomization (Fisher-Yates Shuffle) ---
+        function shuffleArray(array) {
+            for (let i = array.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [array[i], array[j]] = [array[j], array[i]];
+            }
+        }
+
+        // --- Initialization ---
+
+        function init() {
+            // Scene
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x1a1a2e);
+
+            // Initialize PAINTED_GRID
+            for (let z = 0; z < MAZE.length; z++) {
+                PAINTED_GRID[z] = new Array(MAZE[0].length).fill(false);
+            }
+
+            // Camera (First Person)
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(player.position.x, player.position.y, player.position.z);
+
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true; // Enable shadows
+            document.body.appendChild(renderer.domElement);
+
+            createWorld();
+            createLighting();
+            setupControls();
+            updateScore();
+        }
+
+        // --- World Creation ---
+
+        function createWorld() {
+            let availableFloorSpaces = [];
+
+            // Aesthetic Materials
+            const floorMaterial = new THREE.MeshLambertMaterial({ color: 0x4b3f30 }); // Rich dark earth/stone
+            const wallMaterial = new THREE.MeshLambertMaterial({ color: 0x6e635f }); // Warmer stone
+            const treasureMaterial = new THREE.MeshStandardMaterial({ color: 0xffd700, emissive: 0xffa000, metalness: 0.9, roughness: 0.1 }); // Enhanced gold
+
+            // 1. Floor Mesh
+            const floorGeometry = new THREE.PlaneGeometry(MAZE.length * CELL_SIZE, MAZE[0].length * CELL_SIZE);
+            const floor = new THREE.Mesh(floorGeometry, floorMaterial);
+            floor.rotation.x = -Math.PI / 2;
+            floor.position.y = 0;
+            floor.receiveShadow = true;
+            scene.add(floor);
+
+            // 2. Walls and identifying potential treasure spots
+            for (let z = 0; z < MAZE.length; z++) {
+                for (let x = 0; x < MAZE[z].length; x++) {
+                    const type = MAZE[z][x];
+                    const posX = x * CELL_SIZE + CELL_SIZE / 2;
+                    const posZ = z * CELL_SIZE + CELL_SIZE / 2;
+
+                    if (type === 1) { // Wall
+                        const wallGeometry = new THREE.BoxGeometry(CELL_SIZE, CELL_SIZE * 2, CELL_SIZE);
+                        const wall = new THREE.Mesh(wallGeometry, wallMaterial);
+                        wall.position.set(posX, CELL_SIZE, posZ);
+                        wall.castShadow = true;
+                        wall.receiveShadow = true;
+                        scene.add(wall);
+                        WALLS.push(wall);
+                    } else if (type === 0) { // Floor
+                        // Collect all available floor coordinates for potential treasure spawning
+                        // Prevent spawning directly on the starting cell (1, 1)
+                        if (x !== 1 || z !== 1) {
+                            availableFloorSpaces.push({ x, z });
+                        }
+                    }
+                }
+            }
+
+            // 3. Randomly place 5 Treasures
+            shuffleArray(availableFloorSpaces);
+            const treasureSpots = availableFloorSpaces.slice(0, maxScore);
+
+            for (const spot of treasureSpots) {
+                const posX = spot.x * CELL_SIZE + CELL_SIZE / 2;
+                const posZ = spot.z * CELL_SIZE + CELL_SIZE / 2;
+
+                const treasureGeometry = new THREE.IcosahedronGeometry(1.5, 0);
+                const treasure = new THREE.Mesh(treasureGeometry, treasureMaterial);
+                treasure.position.set(posX, 1.5, posZ);
+                treasure.userData = { isTreasure: true, mapX: spot.x, mapZ: spot.z };
+                scene.add(treasure);
+                TREASURES.push(treasure);
+            }
+        }
+
+        // --- Lighting ---
+
+        function createLighting() {
+            // Ambient Light (dim base light, slightly increased intensity for darker scene)
+            const ambientLight = new THREE.AmbientLight(0x404040, 4);
+            scene.add(ambientLight);
+
+            // Directional/Torch Light (soft shadow casting, warm color)
+            const directionalLight = new THREE.DirectionalLight(0xffccaa, 2.5);
+            directionalLight.position.set(0, 30, 0);
+            directionalLight.target.position.set(0, 0, 0);
+            directionalLight.castShadow = true;
+            directionalLight.shadow.mapSize.width = 2048;
+            directionalLight.shadow.mapSize.height = 2048;
+            directionalLight.shadow.camera.near = 0.5;
+            directionalLight.shadow.camera.far = 50;
+            directionalLight.shadow.camera.left = -50;
+            directionalLight.shadow.camera.right = 50;
+            directionalLight.shadow.camera.top = 50;
+            directionalLight.shadow.camera.bottom = -50;
+            scene.add(directionalLight);
+        }
+
+        // --- Modular Movement Action Functions ---
+
+        /**
+         * Sets the player's intended movement direction for the current frame.
+         * @param {number} dir - 1 for forward, -1 for backward, 0 for stop.
+         */
+        function setMovementDirection(dir) {
+            player.moveDirection = dir;
+        }
+
+        /**
+         * Sets the player's intended rotation direction for the current frame.
+         * @param {number} dir - 1 for right (negative rotation), -1 for left (positive rotation), 0 for stop.
+         */
+        function setRotationDirection(dir) {
+            // Note: Direction of -1 is left (positive rotation), 1 is right (negative rotation)
+            player.rotateDirection = dir;
+        }
+
+        // --- Game Logic ---
+
+        function paintCurrentCell() {
+            if (isGameOver) return;
+
+            // Determine current cell coordinates
+            const x = Math.floor(player.position.x / CELL_SIZE);
+            const z = Math.floor(player.position.z / CELL_SIZE);
+
+            // Check boundaries and if it's a floor cell
+            if (x >= 0 && x < MAZE[0].length && z >= 0 && z < MAZE.length && MAZE[z][x] === 0) {
+
+                if (PAINTED_GRID[z][x] === false) {
+                    PAINTED_GRID[z][x] = true;
+
+                    // Create a marker plane (a translucent blue plane)
+                    const markerGeometry = new THREE.PlaneGeometry(CELL_SIZE * 0.8, CELL_SIZE * 0.8);
+                    const markerMaterial = new THREE.MeshBasicMaterial({
+                        color: 0x3399ff, // Bright blue marker color
+                        transparent: true,
+                        opacity: 0.5,
+                        side: THREE.DoubleSide
+                    });
+
+                    const marker = new THREE.Mesh(markerGeometry, markerMaterial);
+
+                    // Position slightly above the floor to prevent z-fighting
+                    const posX = x * CELL_SIZE + CELL_SIZE / 2;
+                    const posZ = z * CELL_SIZE + CELL_SIZE / 2;
+                    marker.position.set(posX, 0.01, posZ);
+
+                    // Rotate to lie flat on the floor
+                    marker.rotation.x = -Math.PI / 2;
+
+                    scene.add(marker);
+                    PAINTED_MARKERS.push(marker);
+
+                    displayMessage(`Cell Marked!`, 1000);
+                } else {
+                    displayMessage(`Cell already marked.`, 1000);
+                }
+            } else {
+                displayMessage(`Cannot mark this area.`, 1000);
+            }
+        }
+
+        function updateScore() {
+            scoreCounter.textContent = `Score: ${score} / ${maxScore}`;
+            if (score === maxScore && !isGameOver) {
+                isGameOver = true;
+                // Enhanced, permanent win message
+                messageBox.textContent = "CONGRATULATIONS! You Win the Quest!";
+                messageBox.classList.remove('hidden', 'bg-yellow-800');
+                messageBox.classList.add('bg-green-700', 'animate-pulse');
+
+                // Stop any previous message from clearing this win message
+                clearTimeout(messageBox.timer);
+            }
+        }
+
+        function displayMessage(text, duration = 2000) {
+            messageBox.textContent = text;
+            messageBox.classList.remove('hidden');
+            clearTimeout(messageBox.timer);
+            messageBox.timer = setTimeout(() => {
+                // Only hide the message if the game is not over
+                if (!isGameOver) {
+                    messageBox.classList.add('hidden');
+                }
+            }, duration);
+        }
+
+        function getClosestInteractable(objects) {
+            let closest = null;
+            // Uses the increased INTERACTION_DISTANCE
+            let minDist = INTERACTION_DISTANCE * INTERACTION_DISTANCE;
+
+            for (const obj of objects) {
+                // Check if object is visible (not yet collected/destroyed)
+                if (!obj.visible) continue;
+
+                const distSq = player.position.distanceToSquared(obj.position);
+                if (distSq < minDist) {
+                    minDist = distSq;
+                    closest = obj;
+                }
+            }
+            return closest;
+        }
+
+        function pickUpTreasure() {
+            if (isGameOver) return;
+            const closestTreasure = getClosestInteractable(TREASURES);
+
+            if (closestTreasure) {
+                closestTreasure.visible = false;
+                score++;
+                updateScore();
+
+                // Only display 'Treasure Collected' if the game hasn't just ended with this pick-up
+                if (!isGameOver) {
+                    displayMessage("Treasure Collected!", 1500);
+                }
+            } else {
+                displayMessage("Nothing to pick up nearby. Get closer!", 1000);
+            }
+        }
+
+        // --- Collision and Movement ---
+
+        function checkCollision(position, direction) {
+            // Raycaster hits objects defined in the WALLS array.
+            raycaster.set(position, direction);
+            raycaster.far = MOVEMENT_SPEED * 1.5; // Check slightly further than movement distance
+
+            const intersections = raycaster.intersectObjects(WALLS, true);
+
+            // Intersection[0] is the closest object hit
+            return intersections.length > 0;
+        }
+
+        /**
+         * Processes input intents (rotation/movement state set by BCI or keyboard)
+         * and calculates the resulting movement vector for the current frame.
+         * @returns {THREE.Vector3} The calculated movement vector (velocity * speed).
+         */
+        function processPlayerInput() {
+            // 1. Handle Rotation based on intended direction
+            if (player.rotateDirection !== 0) {
+                // player.rotateDirection: -1 (left), 1 (right). Rotation must be reversed for intuitive control.
+                player.rotationY += player.rotateDirection * ROTATION_SPEED * -1;
+            }
+            // Update camera rotation immediately
+            camera.rotation.y = player.rotationY;
+
+            const moveDir = new THREE.Vector3();
+
+            // 2. Handle Forward/Backward Movement based on intended direction
+            if (player.moveDirection !== 0) {
+                // Get the current forward direction vector
+                const forwardVector = new THREE.Vector3(0, 0, -1).applyAxisAngle(new THREE.Vector3(0, 1, 0), player.rotationY);
+
+                const movementAmount = player.moveDirection * MOVEMENT_SPEED;
+                moveDir.copy(forwardVector).multiplyScalar(movementAmount);
+            }
+
+            return moveDir;
+        }
+
+
+        function updateMovement() {
+            if (isGameOver) return;
+
+            // 1. Get the intended movement from the modular input function
+            const moveDir = processPlayerInput();
+
+            // 2. Apply movement with collision detection
+            if (moveDir.lengthSq() > 0) { // Check if there is any movement requested
+                // Origin is centered on the player's horizontal position, half player height up
+                const origin = new THREE.Vector3(player.position.x, PLAYER_HEIGHT / 2, player.position.z);
+                const direction = moveDir.clone().normalize();
+
+                if (!checkCollision(origin, direction)) {
+                    // No collision, apply movement
+                    player.position.add(moveDir);
+                    camera.position.copy(player.position);
+                }
+            }
+
+            // Ensure player stays at the correct height
+            player.position.y = PLAYER_HEIGHT;
+            camera.position.y = PLAYER_HEIGHT;
+
+            // Simple animation for treasures
+            TREASURES.forEach(t => {
+                if(t.visible) {
+                    t.rotation.y += 0.02;
+                }
+            });
+        }
+
+        // --- Event Listeners (Controls) ---
+
+        function setupControls() {
+            document.addEventListener('keydown', (event) => {
+                // --- MOVEMENT/ROTATION INPUTS: Call modular action functions ---
+                if (event.key === 'ArrowUp') setMovementDirection(1);
+                if (event.key === 'ArrowDown') setMovementDirection(-1);
+                if (event.key === 'ArrowLeft') setRotationDirection(-1);
+                if (event.key === 'ArrowRight') setRotationDirection(1);
+
+                // --- ACTION INPUTS: Handled as before ---
+                if (event.key === 'e' || event.key === 'E') {
+                    event.preventDefault();
+                    pickUpTreasure();
+                }
+
+                if (event.key === 'p' || event.key === 'P') {
+                    event.preventDefault();
+                    paintCurrentCell();
+                }
+            });
+
+            document.addEventListener('keyup', (event) => {
+                // Reset movement/rotation intent when key is lifted
+                if (event.key === 'ArrowUp' || event.key === 'ArrowDown') setMovementDirection(0);
+                if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') setRotationDirection(0);
+            });
+
+            window.addEventListener('resize', onWindowResize, false);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // --- Main Game Loop ---
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            updateMovement();
+
+            renderer.render(scene, camera);
+        }
+
+        // Start the game when the window loads
+        window.onload = function () {
+            init();
+            animate();
+        };
+
+    </script>
+</body>
+</html>
