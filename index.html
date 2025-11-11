@@ -3,455 +3,164 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NeuroQuest: The Lost Temple</title>
-    <!-- Load Tailwind CSS for UI and Three.js for 3D graphics -->
+    <title>BCI 3D Maze Game</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <style>
-        body { margin: 0; overflow: hidden; font-family: 'Inter', sans-serif; background-color: #140d0a; }
-        canvas { display: block; }
-        /* Style for the Score/Message overlay */
-        #ui-overlay {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            pointer-events: none;
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: 'Courier New', monospace;
         }
-        .ui-panel {
-            background-color: rgba(0, 0, 0, 0.7);
-            border-radius: 8px;
+        #gameCanvas {
+            display: block;
+            width: 100%;
+            height: 100vh;
+        }
+        #gameUI {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: white;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.8);
+            z-index: 10;
+            font-size: 18px;
+        }
+        #wsStatus {
+            position: absolute;
+            top: 20px;
+            right: 20px;
             padding: 10px 20px;
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.5);
+            border-radius: 5px;
+            font-weight: bold;
+            z-index: 10;
+        }
+        .ws-connected {
+            background-color: rgba(34, 197, 94, 0.8);
+            color: white;
+        }
+        .ws-disconnected {
+            background-color: rgba(239, 68, 68, 0.8);
+            color: white;
+        }
+        .ws-connecting {
+            background-color: rgba(251, 191, 36, 0.8);
+            color: black;
         }
     </style>
 </head>
 <body>
-
-    <div id="ui-overlay" class="p-6 flex justify-between items-start">
-        <div id="score-counter" class="ui-panel text-white text-lg font-bold">
-            Score: 0 / 5
-        </div>
-        <div id="message-box" class="ui-panel bg-yellow-800 text-white text-3xl font-extrabold hidden transition duration-500 ease-in-out transform scale-100">
-            <!-- Game messages go here -->
+    <div id="wsStatus" class="ws-disconnected">WebSocket: Disconnected</div>
+    <div id="gameUI">
+        <div>Score: <span id="score">0</span></div>
+        <div>Treasures: <span id="treasures">0</span></div>
+        <div>Obstacles Removed: <span id="obstacles">0</span></div>
+        <div style="margin-top: 10px; font-size: 14px;">
+            <div>Movement: <span id="debugMove">0</span></div>
+            <div>Rotation: <span id="debugRotate">0</span></div>
         </div>
     </div>
+    <canvas id="gameCanvas"></canvas>
 
-    <div class="absolute bottom-4 left-1/2 transform -translate-x-1/2 text-white bg-black bg-opacity-70 p-2 rounded-lg text-sm shadow-xl">
-        Controls: **↑↓←→** Movement | **E** Pick up Treasure | **P** Mark Cell
-    </div>
-
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script>
-        // Set up global environment variables for Firebase (required in canvas environment)
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-        // Note: No Firebase is needed for this simple single-player game, but these variables are included for compliance.
-
-        // --- Game Setup Constants ---
-        const CELL_SIZE = 10;
-        const PLAYER_HEIGHT = 1.8;
-        const ROTATION_SPEED = 0.05;
-        const MOVEMENT_SPEED = 0.2;
-        // CHANGED: Increased the interaction distance for easier, more forgiving treasure collection
-        const INTERACTION_DISTANCE = 3.0;
-
-        // --- Game State and Engine Variables ---
-        let scene, camera, renderer;
-        const raycaster = new THREE.Raycaster();
-
-        // The 'keyboard' map is no longer used for movement/rotation,
-        // but kept for tracking other single-press action keys (like 'E' or 'P').
-        const keyboard = {};
-
-        const player = {
-            mesh: null,
-            // Start at (1, 1) cell center
-            position: new THREE.Vector3(1 * CELL_SIZE + CELL_SIZE / 2, PLAYER_HEIGHT, 1 * CELL_SIZE + CELL_SIZE / 2),
-            rotationY: 0,
-            velocity: new THREE.Vector3(),
-            // NEW: Input intent trackers (modular input for BCI)
-            moveDirection: 0, // 1 for forward, -1 for backward, 0 for stop
-            rotateDirection: 0, // 1 for right, -1 for left, 0 for stop
+        // ============================================
+        // GAME CONFIG
+        // ============================================
+        const GAME_CONFIG = {
+            MAZE_SIZE: 10,
+            CELL_SIZE: 10,
+            WALL_HEIGHT: 5,
+            WALL_THICKNESS: 0.5,
+            PLAYER_HEIGHT: 2,
+            PLAYER_SPEED: 0.2,       // Increased for better control
+            ROTATION_SPEED: 0.1,     // Increased for better control
+            TREASURE_COUNT: 10,      // More treasures
+            WS_URL: 'ws://127.0.0.1:8000/ws',
+            WS_RECONNECT_DELAY: 3000
         };
 
-        let score = 0;
-        const maxScore = 5;
-        let isGameOver = false;
+        // ============================================
+        // GAME STATE
+        // ============================================
+        const gameState = {
+            score: 0,
+            treasuresCollected: 0,
+            obstaclesRemoved: 0
+        };
 
-        // NEW FEATURE: Maze marking/painting state
-        let PAINTED_GRID = [];
-        const PAINTED_MARKERS = [];
+        // ============================================
+        // PLAYER STATE
+        // ============================================
+        const player = {
+            position: { x: 0, z: 0 },
+              rotation: 0
+        };
 
-        // --- DOM Elements ---
-        const scoreCounter = document.getElementById('score-counter');
-        const messageBox = document.getElementById('message-box');
+           // Command queue system
+           const commandQueue = [];
+           let isExecutingCommand = false;
 
-        // --- Maze Definition (Grid Map) ---
-        // 0: Floor (potential treasure spot), 1: Wall
-        const MAZE = [
-            // X=0  1  2  3  4  5  6  7  8  9  <-- X Coordinates
-            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1], // Z=0
-            [1, 0, 0, 0, 0, 0, 0, 0, 0, 1], // Z=1
-            [1, 0, 1, 1, 0, 0, 0, 1, 0, 1], // Z=2
-            [1, 0, 1, 0, 0, 0, 0, 1, 0, 1], // Z=3
-            [1, 0, 0, 0, 0, 0, 1, 1, 0, 1], // Z=4
-            [1, 0, 0, 0, 0, 0, 0, 0, 0, 1], // Z=5
-            [1, 0, 1, 1, 1, 0, 1, 1, 0, 1], // Z=6
-            [1, 0, 0, 0, 0, 0, 0, 1, 0, 1], // Z=7
-            [1, 0, 1, 0, 1, 0, 0, 0, 0, 1], // Z=8
-            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]  // Z=9
-        ];
-        const WALLS = [];
-        const TREASURES = [];
+        // ============================================
+        // WEBSOCKET STATE
+        // ============================================
+        let ws = null;
+        let wsReconnectTimeout = null;
 
+        // ============================================
+        // THREE.JS SCENE SETUP
+        // ============================================
+        let scene, camera, renderer;
+        let maze = [];
+        let treasures = [];
+        let paintedCellMeshes = new Map();
 
-        // --- Utility Function for Randomization (Fisher-Yates Shuffle) ---
-        function shuffleArray(array) {
-            for (let i = array.length - 1; i > 0; i--) {
-                const j = Math.floor(Math.random() * (i + 1));
-                [array[i], array[j]] = [array[j], array[i]];
-            }
-        }
-
-        // --- Initialization ---
-
-        function init() {
+        function initThreeJS() {
             // Scene
             scene = new THREE.Scene();
-            scene.background = new THREE.Color(0x1a1a2e);
+            scene.background = new THREE.Color(0x87CEEB);
+            scene.fog = new THREE.Fog(0x87CEEB, 0, 100);
 
-            // Initialize PAINTED_GRID
-            for (let z = 0; z < MAZE.length; z++) {
-                PAINTED_GRID[z] = new Array(MAZE[0].length).fill(false);
-            }
-
-            // Camera (First Person)
-            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-            camera.position.set(player.position.x, player.position.y, player.position.z);
+            // Camera (first-person view)
+            camera = new THREE.PerspectiveCamera(
+                75,
+                window.innerWidth / window.innerHeight,
+                0.1,
+                1000
+            );
+            camera.position.y = GAME_CONFIG.PLAYER_HEIGHT;
 
             // Renderer
-            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer = new THREE.WebGLRenderer({
+                canvas: document.getElementById('gameCanvas'),
+                antialias: true
+            });
             renderer.setSize(window.innerWidth, window.innerHeight);
-            renderer.shadowMap.enabled = true; // Enable shadows
-            document.body.appendChild(renderer.domElement);
+            renderer.shadowMap.enabled = true;
 
-            createWorld();
-            createLighting();
-            setupControls();
-            updateScore();
-        }
-
-        // --- World Creation ---
-
-        function createWorld() {
-            let availableFloorSpaces = [];
-
-            // Aesthetic Materials
-            const floorMaterial = new THREE.MeshLambertMaterial({ color: 0x4b3f30 }); // Rich dark earth/stone
-            const wallMaterial = new THREE.MeshLambertMaterial({ color: 0x6e635f }); // Warmer stone
-            const treasureMaterial = new THREE.MeshStandardMaterial({ color: 0xffd700, emissive: 0xffa000, metalness: 0.9, roughness: 0.1 }); // Enhanced gold
-
-            // 1. Floor Mesh
-            const floorGeometry = new THREE.PlaneGeometry(MAZE.length * CELL_SIZE, MAZE[0].length * CELL_SIZE);
-            const floor = new THREE.Mesh(floorGeometry, floorMaterial);
-            floor.rotation.x = -Math.PI / 2;
-            floor.position.y = 0;
-            floor.receiveShadow = true;
-            scene.add(floor);
-
-            // 2. Walls and identifying potential treasure spots
-            for (let z = 0; z < MAZE.length; z++) {
-                for (let x = 0; x < MAZE[z].length; x++) {
-                    const type = MAZE[z][x];
-                    const posX = x * CELL_SIZE + CELL_SIZE / 2;
-                    const posZ = z * CELL_SIZE + CELL_SIZE / 2;
-
-                    if (type === 1) { // Wall
-                        const wallGeometry = new THREE.BoxGeometry(CELL_SIZE, CELL_SIZE * 2, CELL_SIZE);
-                        const wall = new THREE.Mesh(wallGeometry, wallMaterial);
-                        wall.position.set(posX, CELL_SIZE, posZ);
-                        wall.castShadow = true;
-                        wall.receiveShadow = true;
-                        scene.add(wall);
-                        WALLS.push(wall);
-                    } else if (type === 0) { // Floor
-                        // Collect all available floor coordinates for potential treasure spawning
-                        // Prevent spawning directly on the starting cell (1, 1)
-                        if (x !== 1 || z !== 1) {
-                            availableFloorSpaces.push({ x, z });
-                        }
-                    }
-                }
-            }
-
-            // 3. Randomly place 5 Treasures
-            shuffleArray(availableFloorSpaces);
-            const treasureSpots = availableFloorSpaces.slice(0, maxScore);
-
-            for (const spot of treasureSpots) {
-                const posX = spot.x * CELL_SIZE + CELL_SIZE / 2;
-                const posZ = spot.z * CELL_SIZE + CELL_SIZE / 2;
-
-                const treasureGeometry = new THREE.IcosahedronGeometry(1.5, 0);
-                const treasure = new THREE.Mesh(treasureGeometry, treasureMaterial);
-                treasure.position.set(posX, 1.5, posZ);
-                treasure.userData = { isTreasure: true, mapX: spot.x, mapZ: spot.z };
-                scene.add(treasure);
-                TREASURES.push(treasure);
-            }
-        }
-
-        // --- Lighting ---
-
-        function createLighting() {
-            // Ambient Light (dim base light, slightly increased intensity for darker scene)
-            const ambientLight = new THREE.AmbientLight(0x404040, 4);
+            // Lighting
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
             scene.add(ambientLight);
 
-            // Directional/Torch Light (soft shadow casting, warm color)
-            const directionalLight = new THREE.DirectionalLight(0xffccaa, 2.5);
-            directionalLight.position.set(0, 30, 0);
-            directionalLight.target.position.set(0, 0, 0);
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            directionalLight.position.set(50, 100, 50);
             directionalLight.castShadow = true;
             directionalLight.shadow.mapSize.width = 2048;
             directionalLight.shadow.mapSize.height = 2048;
-            directionalLight.shadow.camera.near = 0.5;
-            directionalLight.shadow.camera.far = 50;
-            directionalLight.shadow.camera.left = -50;
-            directionalLight.shadow.camera.right = 50;
-            directionalLight.shadow.camera.top = 50;
-            directionalLight.shadow.camera.bottom = -50;
             scene.add(directionalLight);
-        }
 
-        // --- Modular Movement Action Functions ---
+            // Ground
+            const groundGeometry = new THREE.PlaneGeometry(
+                GAME_CONFIG.MAZE_SIZE * GAME_CONFIG.CELL_SIZE,
+                GAME_CONFIG.MAZE_SIZE * GAME_CONFIG.CELL_SIZE
+            );
+            const groundMaterial = new THREE.MeshLambertMaterial({ color: 0x90EE90 });
+            const ground = new THREE.Mesh(groundGeometry, groundMaterial);
+            ground.rotation.x = -Math.PI / 2;
+            ground.receiveShadow = true;
+            scene.add(ground);
 
-        /**
-         * Sets the player's intended movement direction for the current frame.
-         * @param {number} dir - 1 for forward, -1 for backward, 0 for stop.
-         */
-        function setMovementDirection(dir) {
-            player.moveDirection = dir;
-        }
-
-        /**
-         * Sets the player's intended rotation direction for the current frame.
-         * @param {number} dir - 1 for right (negative rotation), -1 for left (positive rotation), 0 for stop.
-         */
-        function setRotationDirection(dir) {
-            // Note: Direction of -1 is left (positive rotation), 1 is right (negative rotation)
-            player.rotateDirection = dir;
-        }
-
-        // --- Game Logic ---
-
-        function paintCurrentCell() {
-            if (isGameOver) return;
-
-            // Determine current cell coordinates
-            const x = Math.floor(player.position.x / CELL_SIZE);
-            const z = Math.floor(player.position.z / CELL_SIZE);
-
-            // Check boundaries and if it's a floor cell
-            if (x >= 0 && x < MAZE[0].length && z >= 0 && z < MAZE.length && MAZE[z][x] === 0) {
-
-                if (PAINTED_GRID[z][x] === false) {
-                    PAINTED_GRID[z][x] = true;
-
-                    // Create a marker plane (a translucent blue plane)
-                    const markerGeometry = new THREE.PlaneGeometry(CELL_SIZE * 0.8, CELL_SIZE * 0.8);
-                    const markerMaterial = new THREE.MeshBasicMaterial({
-                        color: 0x3399ff, // Bright blue marker color
-                        transparent: true,
-                        opacity: 0.5,
-                        side: THREE.DoubleSide
-                    });
-
-                    const marker = new THREE.Mesh(markerGeometry, markerMaterial);
-
-                    // Position slightly above the floor to prevent z-fighting
-                    const posX = x * CELL_SIZE + CELL_SIZE / 2;
-                    const posZ = z * CELL_SIZE + CELL_SIZE / 2;
-                    marker.position.set(posX, 0.01, posZ);
-
-                    // Rotate to lie flat on the floor
-                    marker.rotation.x = -Math.PI / 2;
-
-                    scene.add(marker);
-                    PAINTED_MARKERS.push(marker);
-
-                    displayMessage(`Cell Marked!`, 1000);
-                } else {
-                    displayMessage(`Cell already marked.`, 1000);
-                }
-            } else {
-                displayMessage(`Cannot mark this area.`, 1000);
-            }
-        }
-
-        function updateScore() {
-            scoreCounter.textContent = `Score: ${score} / ${maxScore}`;
-            if (score === maxScore && !isGameOver) {
-                isGameOver = true;
-                // Enhanced, permanent win message
-                messageBox.textContent = "CONGRATULATIONS! You Win the Quest!";
-                messageBox.classList.remove('hidden', 'bg-yellow-800');
-                messageBox.classList.add('bg-green-700', 'animate-pulse');
-
-                // Stop any previous message from clearing this win message
-                clearTimeout(messageBox.timer);
-            }
-        }
-
-        function displayMessage(text, duration = 2000) {
-            messageBox.textContent = text;
-            messageBox.classList.remove('hidden');
-            clearTimeout(messageBox.timer);
-            messageBox.timer = setTimeout(() => {
-                // Only hide the message if the game is not over
-                if (!isGameOver) {
-                    messageBox.classList.add('hidden');
-                }
-            }, duration);
-        }
-
-        function getClosestInteractable(objects) {
-            let closest = null;
-            // Uses the increased INTERACTION_DISTANCE
-            let minDist = INTERACTION_DISTANCE * INTERACTION_DISTANCE;
-
-            for (const obj of objects) {
-                // Check if object is visible (not yet collected/destroyed)
-                if (!obj.visible) continue;
-
-                const distSq = player.position.distanceToSquared(obj.position);
-                if (distSq < minDist) {
-                    minDist = distSq;
-                    closest = obj;
-                }
-            }
-            return closest;
-        }
-
-        function pickUpTreasure() {
-            if (isGameOver) return;
-            const closestTreasure = getClosestInteractable(TREASURES);
-
-            if (closestTreasure) {
-                closestTreasure.visible = false;
-                score++;
-                updateScore();
-
-                // Only display 'Treasure Collected' if the game hasn't just ended with this pick-up
-                if (!isGameOver) {
-                    displayMessage("Treasure Collected!", 1500);
-                }
-            } else {
-                displayMessage("Nothing to pick up nearby. Get closer!", 1000);
-            }
-        }
-
-        // --- Collision and Movement ---
-
-        function checkCollision(position, direction) {
-            // Raycaster hits objects defined in the WALLS array.
-            raycaster.set(position, direction);
-            raycaster.far = MOVEMENT_SPEED * 1.5; // Check slightly further than movement distance
-
-            const intersections = raycaster.intersectObjects(WALLS, true);
-
-            // Intersection[0] is the closest object hit
-            return intersections.length > 0;
-        }
-
-        /**
-         * Processes input intents (rotation/movement state set by BCI or keyboard)
-         * and calculates the resulting movement vector for the current frame.
-         * @returns {THREE.Vector3} The calculated movement vector (velocity * speed).
-         */
-        function processPlayerInput() {
-            // 1. Handle Rotation based on intended direction
-            if (player.rotateDirection !== 0) {
-                // player.rotateDirection: -1 (left), 1 (right). Rotation must be reversed for intuitive control.
-                player.rotationY += player.rotateDirection * ROTATION_SPEED * -1;
-            }
-            // Update camera rotation immediately
-            camera.rotation.y = player.rotationY;
-
-            const moveDir = new THREE.Vector3();
-
-            // 2. Handle Forward/Backward Movement based on intended direction
-            if (player.moveDirection !== 0) {
-                // Get the current forward direction vector
-                const forwardVector = new THREE.Vector3(0, 0, -1).applyAxisAngle(new THREE.Vector3(0, 1, 0), player.rotationY);
-
-                const movementAmount = player.moveDirection * MOVEMENT_SPEED;
-                moveDir.copy(forwardVector).multiplyScalar(movementAmount);
-            }
-
-            return moveDir;
-        }
-
-
-        function updateMovement() {
-            if (isGameOver) return;
-
-            // 1. Get the intended movement from the modular input function
-            const moveDir = processPlayerInput();
-
-            // 2. Apply movement with collision detection
-            if (moveDir.lengthSq() > 0) { // Check if there is any movement requested
-                // Origin is centered on the player's horizontal position, half player height up
-                const origin = new THREE.Vector3(player.position.x, PLAYER_HEIGHT / 2, player.position.z);
-                const direction = moveDir.clone().normalize();
-
-                if (!checkCollision(origin, direction)) {
-                    // No collision, apply movement
-                    player.position.add(moveDir);
-                    camera.position.copy(player.position);
-                }
-            }
-
-            // Ensure player stays at the correct height
-            player.position.y = PLAYER_HEIGHT;
-            camera.position.y = PLAYER_HEIGHT;
-
-            // Simple animation for treasures
-            TREASURES.forEach(t => {
-                if(t.visible) {
-                    t.rotation.y += 0.02;
-                }
-            });
-        }
-
-        // --- Event Listeners (Controls) ---
-
-        function setupControls() {
-            document.addEventListener('keydown', (event) => {
-                // --- MOVEMENT/ROTATION INPUTS: Call modular action functions ---
-                if (event.key === 'ArrowUp') setMovementDirection(1);
-                if (event.key === 'ArrowDown') setMovementDirection(-1);
-                if (event.key === 'ArrowLeft') setRotationDirection(-1);
-                if (event.key === 'ArrowRight') setRotationDirection(1);
-
-                // --- ACTION INPUTS: Handled as before ---
-                if (event.key === 'e' || event.key === 'E') {
-                    event.preventDefault();
-                    pickUpTreasure();
-                }
-
-                if (event.key === 'p' || event.key === 'P') {
-                    event.preventDefault();
-                    paintCurrentCell();
-                }
-            });
-
-            document.addEventListener('keyup', (event) => {
-                // Reset movement/rotation intent when key is lifted
-                if (event.key === 'ArrowUp' || event.key === 'ArrowDown') setMovementDirection(0);
-                if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') setRotationDirection(0);
-            });
-
-            window.addEventListener('resize', onWindowResize, false);
+            // Window resize handler
+            window.addEventListener('resize', onWindowResize);
         }
 
         function onWindowResize() {
@@ -460,22 +169,574 @@
             renderer.setSize(window.innerWidth, window.innerHeight);
         }
 
-        // --- Main Game Loop ---
+        // ============================================
+        // MAZE GENERATION
+        // ============================================
+        function generateMaze() {
+            // Simple maze: grid with some walls
+            const size = GAME_CONFIG.MAZE_SIZE;
+            maze = Array(size).fill(null).map(() => Array(size).fill(0));
 
+            // Create outer walls
+            for (let i = 0; i < size; i++) {
+                maze[0][i] = 1;
+                maze[size - 1][i] = 1;
+                maze[i][0] = 1;
+                maze[i][size - 1] = 1;
+            }
+
+            // Create some internal walls randomly
+            for (let i = 2; i < size - 2; i += 2) {
+                for (let j = 2; j < size - 2; j += 2) {
+                    if (Math.random() > 0.3) {
+                        maze[i][j] = 1;
+                        // Add some adjacent walls
+                        const dir = Math.floor(Math.random() * 4);
+                        if (dir === 0 && i > 0) maze[i - 1][j] = 1;
+                        else if (dir === 1 && i < size - 1) maze[i + 1][j] = 1;
+                        else if (dir === 2 && j > 0) maze[i][j - 1] = 1;
+                        else if (dir === 3 && j < size - 1) maze[i][j + 1] = 1;
+                    }
+                }
+            }
+
+            // Ensure starting position is clear
+            maze[5][5] = 0;
+            if (maze[4]) maze[4][5] = 0;
+            if (maze[5]) maze[5][4] = 0;
+        }
+
+        function buildMazeWalls() {
+            const wallMaterial = new THREE.MeshLambertMaterial({ color: 0x8B4513 });
+            const size = GAME_CONFIG.MAZE_SIZE;
+
+            for (let i = 0; i < size; i++) {
+                for (let j = 0; j < size; j++) {
+                    if (maze[i][j] === 1) {
+                        const wallGeometry = new THREE.BoxGeometry(
+                            GAME_CONFIG.CELL_SIZE,
+                            GAME_CONFIG.WALL_HEIGHT,
+                            GAME_CONFIG.CELL_SIZE
+                        );
+                        const wall = new THREE.Mesh(wallGeometry, wallMaterial);
+                        
+                        // Position in world coordinates
+                        wall.position.x = (j - size / 2) * GAME_CONFIG.CELL_SIZE;
+                        wall.position.y = GAME_CONFIG.WALL_HEIGHT / 2;
+                        wall.position.z = (i - size / 2) * GAME_CONFIG.CELL_SIZE;
+                        
+                        wall.castShadow = true;
+                        wall.receiveShadow = true;
+                        wall.userData.isWall = true;
+                        scene.add(wall);
+                    }
+                }
+            }
+        }
+
+        // ============================================
+        // TREASURE SYSTEM
+        // ============================================
+        function spawnTreasures() {
+            const treasureMaterial = new THREE.MeshStandardMaterial({
+                color: 0xFFD700,
+                emissive: 0xFFD700,
+                emissiveIntensity: 0.5,
+                metalness: 0.8,
+                roughness: 0.2
+            });
+
+            const size = GAME_CONFIG.MAZE_SIZE;
+            let spawned = 0;
+
+            while (spawned < GAME_CONFIG.TREASURE_COUNT) {
+                const i = Math.floor(Math.random() * (size - 2)) + 1;
+                const j = Math.floor(Math.random() * (size - 2)) + 1;
+
+                // Only spawn on empty cells
+                if (maze[i][j] === 0 && !(i === 5 && j === 5)) {
+                    const treasureGeometry = new THREE.SphereGeometry(0.5, 16, 16);
+                    const treasure = new THREE.Mesh(treasureGeometry, treasureMaterial);
+                    
+                    treasure.position.x = (j - size / 2) * GAME_CONFIG.CELL_SIZE;
+                    treasure.position.y = 1;
+                    treasure.position.z = (i - size / 2) * GAME_CONFIG.CELL_SIZE;
+                    
+                    treasure.castShadow = true;
+                    treasure.userData.isTreasure = true;
+                    treasure.userData.gridPos = { i, j };
+                    
+                    scene.add(treasure);
+                    treasures.push(treasure);
+                    spawned++;
+                }
+            }
+        }
+
+        function getDistance(x1, z1, x2, z2) {
+            return Math.sqrt(Math.pow(x2 - x1, 2) + Math.pow(z2 - z1, 2));
+        }
+
+        function pickUpTreasure() {
+            const pickupRange = 2; // Units in world space
+            
+            for (let i = treasures.length - 1; i >= 0; i--) {
+                const treasure = treasures[i];
+                const distance = getDistance(
+                    player.position.x,
+                    player.position.z,
+                    treasure.position.x,
+                    treasure.position.z
+                );
+                
+                if (distance <= pickupRange) {
+                    scene.remove(treasure);
+                    treasures.splice(i, 1);
+                    
+                    gameState.treasuresCollected++;
+                    gameState.score += 100;
+                    updateUI();
+                    
+                    console.log(`Treasure collected! Total: ${gameState.treasuresCollected}`);
+                    return;
+                }
+            }
+            console.log('No treasure within range');
+        }
+
+        // ============================================
+        // OBSTACLE SYSTEM
+        // ============================================
+        let obstacles = [];
+
+        function spawnObstacles() {
+            const obstacleGeometry = new THREE.BoxGeometry(1.5, 1.5, 1.5);
+            const obstacleMaterial = new THREE.MeshStandardMaterial({
+                color: 0xFF4444,
+                metalness: 0.7,
+                roughness: 0.3,
+                emissive: 0x441111
+            });
+
+            const size = GAME_CONFIG.MAZE_SIZE;
+            const obstacleCount = Math.floor(size * size * 0.1); // 10% of maze cells
+
+            for (let i = 0; i < obstacleCount; i++) {
+                const x = Math.floor(Math.random() * (size - 2)) + 1;
+                const z = Math.floor(Math.random() * (size - 2)) + 1;
+
+                // Don't spawn on walls, treasures, or starting position
+                if (maze[z][x] === 0 && !(x === 5 && z === 5)) {
+                    const obstacle = new THREE.Mesh(obstacleGeometry, obstacleMaterial);
+                    
+                    obstacle.position.x = (x - size / 2) * GAME_CONFIG.CELL_SIZE;
+                    obstacle.position.y = 0.75;
+                    obstacle.position.z = (z - size / 2) * GAME_CONFIG.CELL_SIZE;
+                    
+                    obstacle.castShadow = true;
+                    obstacle.receiveShadow = true;
+                    obstacle.userData.isObstacle = true;
+                    
+                    scene.add(obstacle);
+                    obstacles.push(obstacle);
+                }
+            }
+        }
+
+        function removeNearbyObstacle() {
+            const interactionRange = 2.5; // Units in world space
+            
+            let nearestDistance = Infinity;
+            let nearestObstacle = null;
+            let nearestIndex = -1;
+
+            // Find the nearest obstacle within range
+            for (let i = obstacles.length - 1; i >= 0; i--) {
+                const obstacle = obstacles[i];
+                const distance = getDistance(
+                    player.position.x,
+                    player.position.z,
+                    obstacle.position.x,
+                    obstacle.position.z
+                );
+                
+                if (distance < nearestDistance) {
+                    nearestDistance = distance;
+                    nearestObstacle = obstacle;
+                    nearestIndex = i;
+                }
+            }
+            
+            // Remove the nearest obstacle if it's within range
+            if (nearestObstacle && nearestDistance <= interactionRange) {
+                // Create a quick fade-out effect
+                const opacity = { value: 1 };
+                const fadeOutDuration = 200; // milliseconds
+
+                const tween = {
+                    start: Date.now(),
+                    animate: function() {
+                        const elapsed = Date.now() - this.start;
+                        const progress = Math.min(elapsed / fadeOutDuration, 1);
+                        
+                        nearestObstacle.material.opacity = 1 - progress;
+                        
+                        if (progress < 1) {
+                            requestAnimationFrame(() => this.animate());
+                        } else {
+                            // Remove the obstacle after fade-out
+                            scene.remove(nearestObstacle);
+                            obstacles.splice(nearestIndex, 1);
+                        }
+                    }
+                };
+
+                // Make the material transparent for fade-out
+                nearestObstacle.material.transparent = true;
+                tween.animate();
+                
+                // Update game state
+                gameState.obstaclesRemoved++;
+                gameState.score += 50;
+                updateUI();
+                
+                console.log(`Obstacle destroyed! Total: ${gameState.obstaclesRemoved}`);
+            } else {
+                console.log('No obstacle within range');
+            }
+        }
+
+        // ============================================
+        // COLLISION DETECTION
+        // ============================================
+        function worldToGrid(worldX, worldZ) {
+            const size = GAME_CONFIG.MAZE_SIZE;
+            const j = Math.floor(worldX / GAME_CONFIG.CELL_SIZE + size / 2);
+            const i = Math.floor(worldZ / GAME_CONFIG.CELL_SIZE + size / 2);
+            return { i, j };
+        }
+
+        function checkCollision(newX, newZ) {
+            const cell = worldToGrid(newX, newZ);
+            
+            // Check bounds
+            if (cell.i < 0 || cell.i >= GAME_CONFIG.MAZE_SIZE ||
+                cell.j < 0 || cell.j >= GAME_CONFIG.MAZE_SIZE) {
+                return true;
+            }
+            
+            // Check wall collision
+            if (maze[cell.i][cell.j] === 1) {
+                return true;
+            }
+            
+            return false;
+        }
+
+        // ============================================
+        // MOVEMENT CONTROL FUNCTIONS
+        // ============================================
+            function queueCommand(command) {
+                commandQueue.push(command);
+                console.log(`Command queued: ${command}, Queue length: ${commandQueue.length}`);
+        }
+
+            function executeNextCommand() {
+                if (isExecutingCommand || commandQueue.length === 0) {
+                    return;
+                }
+
+                isExecutingCommand = true;
+                const command = commandQueue.shift();
+                console.log(`Executing command: ${command}, Remaining in queue: ${commandQueue.length}`);
+
+                switch (command) {
+                    case 'up':
+                        executeMoveForward();
+                        break;
+                    case 'down':
+                        executeMoveBackward();
+                        break;
+                    case 'left':
+                        executeRotateLeft();
+                        break;
+                    case 'right':
+                        executeRotateRight();
+                        break;
+                    case 'pull':
+                        pickUpTreasure();
+                        isExecutingCommand = false;  // Instant action, no delay needed
+                        break;
+                    case 'push':
+                        removeNearbyObstacle();
+                        isExecutingCommand = false;  // Instant action, no delay needed
+                        break;
+                    case 'stop':
+                        commandQueue.length = 0;  // Clear queue
+                        isExecutingCommand = false;
+                        console.log('Queue cleared');
+                        break;
+                    default:
+                        console.warn(`Unknown command: "${command}"`);
+                        isExecutingCommand = false;
+                        break;
+                }
+        }
+
+            function executeMoveForward() {
+                const moveSpeed = GAME_CONFIG.PLAYER_SPEED;
+                const newX = player.position.x + Math.sin(player.rotation) * moveSpeed;
+                const newZ = player.position.z + Math.cos(player.rotation) * moveSpeed;
+
+                if (!checkCollision(newX, newZ)) {
+                    player.position.x = newX;
+                    player.position.z = newZ;
+                    console.log('Moved forward');
+                } else {
+                    console.log('Forward movement blocked by collision');
+                }
+                isExecutingCommand = false;
+            }
+
+            function executeMoveBackward() {
+                const moveSpeed = -GAME_CONFIG.PLAYER_SPEED;
+                const newX = player.position.x + Math.sin(player.rotation) * moveSpeed;
+                const newZ = player.position.z + Math.cos(player.rotation) * moveSpeed;
+
+                if (!checkCollision(newX, newZ)) {
+                    player.position.x = newX;
+                    player.position.z = newZ;
+                    console.log('Moved backward');
+                } else {
+                    console.log('Backward movement blocked by collision');
+                }
+                isExecutingCommand = false;
+            }
+
+            function executeRotateLeft() {
+                player.rotation -= GAME_CONFIG.ROTATION_SPEED;
+                console.log('Rotated left');
+                isExecutingCommand = false;
+            }
+
+            function executeRotateRight() {
+                player.rotation += GAME_CONFIG.ROTATION_SPEED;
+                console.log('Rotated right');
+                isExecutingCommand = false;
+        }
+
+        // ============================================
+        // PLAYER INPUT PROCESSING
+        // ============================================
+        function processPlayerInput() {
+                // Try to execute the next command in the queue
+                executeNextCommand();
+            
+                // Update debug UI with queue length
+                document.getElementById('debugMove').textContent = commandQueue.length;
+                document.getElementById('debugRotate').textContent = isExecutingCommand ? '1' : '0';
+        }
+
+        // ============================================
+        // MOVEMENT UPDATE
+        // ============================================
+        function updateMovement() {
+            // Update camera position and rotation
+            camera.position.x = player.position.x;
+            camera.position.z = player.position.z;
+            camera.rotation.y = player.rotation;
+        }
+
+        // ============================================
+        // WEBSOCKET SETUP
+        // ============================================
+        function setupWebSocket() {
+            // Clear any existing reconnect timeout
+            if (wsReconnectTimeout) {
+                clearTimeout(wsReconnectTimeout);
+                wsReconnectTimeout = null;
+            }
+
+            console.log(`Connecting to WebSocket: ${GAME_CONFIG.WS_URL}`);
+            updateWSStatus('connecting');
+
+            try {
+                ws = new WebSocket(GAME_CONFIG.WS_URL);
+
+                ws.onopen = () => {
+                    console.log('WebSocket connected successfully');
+                    updateWSStatus('connected');
+                };
+
+                ws.onmessage = (event) => {
+                    const command = event.data.trim().toLowerCase();
+                    console.log(`WebSocket command received: "${command}"`);
+
+                        // Queue all commands for sequential execution
+                        queueCommand(command);
+                };
+
+                ws.onerror = (error) => {
+                    console.error('WebSocket error:', error);
+                    updateWSStatus('disconnected');
+                };
+
+                ws.onclose = () => {
+                    console.log('WebSocket closed. Attempting to reconnect...');
+                    updateWSStatus('disconnected');
+                    ws = null;
+                    
+                    // Attempt to reconnect after delay
+                    wsReconnectTimeout = setTimeout(() => {
+                        setupWebSocket();
+                    }, GAME_CONFIG.WS_RECONNECT_DELAY);
+                };
+            } catch (error) {
+                console.error('Failed to create WebSocket:', error);
+                updateWSStatus('disconnected');
+                
+                // Retry connection
+                wsReconnectTimeout = setTimeout(() => {
+                    setupWebSocket();
+                }, GAME_CONFIG.WS_RECONNECT_DELAY);
+            }
+        }
+
+        function updateWSStatus(status) {
+            const statusDiv = document.getElementById('wsStatus');
+            statusDiv.className = '';
+            
+            switch (status) {
+                case 'connected':
+                    statusDiv.textContent = 'WebSocket: Connected';
+                    statusDiv.classList.add('ws-connected');
+                    break;
+                case 'disconnected':
+                    statusDiv.textContent = 'WebSocket: Disconnected';
+                    statusDiv.classList.add('ws-disconnected');
+                    break;
+                case 'connecting':
+                    statusDiv.textContent = 'WebSocket: Connecting...';
+                    statusDiv.classList.add('ws-connecting');
+                    break;
+            }
+        }
+
+        // ============================================
+        // UI UPDATES
+        // ============================================
+        function updateUI() {
+            document.getElementById('score').textContent = gameState.score;
+            document.getElementById('treasures').textContent = gameState.treasuresCollected;
+            document.getElementById('obstacles').textContent = gameState.obstaclesRemoved;
+        }
+
+        // ============================================
+        // ANIMATION LOOP
+        // ============================================
         function animate() {
             requestAnimationFrame(animate);
 
+            // Process player input (updates debug UI only, doesn't reset directions)
+            processPlayerInput();
+
+            // Update movement based on persistent direction state
             updateMovement();
 
+            // Render the scene
             renderer.render(scene, camera);
         }
 
-        // Start the game when the window loads
-        window.onload = function () {
-            init();
-            animate();
-        };
+        // ============================================
+        // INITIALIZATION
+        // ============================================
+        function init() {
+            console.log('Initializing BCI 3D Maze Game...');
 
+            // Initialize Three.js
+            initThreeJS();
+
+            // Generate and build maze
+            generateMaze();
+            buildMazeWalls();
+
+            // Spawn treasures and obstacles
+            spawnTreasures();
+            spawnObstacles();
+
+            // Set initial player position
+            player.position.x = 0;
+            player.position.z = 0;
+            player.rotation = 0;
+            camera.position.x = player.position.x;
+            camera.position.z = player.position.z;
+
+            // Update UI
+            updateUI();
+
+            // Setup WebSocket
+            setupWebSocket();
+
+            // Start animation loop
+            animate();
+
+            console.log('Game initialized successfully!');
+            console.log('Waiting for WebSocket commands...');
+            console.log('Commands: up, down, left, right, stop, pull, push');
+        }
+
+        // ============================================
+        // KEYBOARD CONTROLS
+        // ============================================
+        function setupKeyboardControls() {
+            window.addEventListener('keydown', (event) => {
+                // Prevent default behavior for game control keys
+                if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' ', 'p', 'P'].includes(event.key)) {
+                    event.preventDefault();
+                }
+
+                // Only process if not being held down
+                if (event.repeat) return;
+
+                switch (event.key) {
+                    case 'ArrowUp':
+                        queueCommand('up');
+                        break;
+                    case 'ArrowDown':
+                        queueCommand('down');
+                        break;
+                    case 'ArrowLeft':
+                        queueCommand('left');
+                        break;
+                    case 'ArrowRight':
+                        queueCommand('right');
+                        break;
+                    case ' ':  // Spacebar
+                        queueCommand('pull');
+                        break;
+                    case 'p':
+                    case 'P':
+                        queueCommand('push');
+                        break;
+                }
+            });
+        }
+
+        // Start the game when page loads
+        window.addEventListener('DOMContentLoaded', () => {
+            init();
+            setupKeyboardControls();
+        });
+
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', () => {
+            if (ws) {
+                ws.close();
+            }
+            if (wsReconnectTimeout) {
+                clearTimeout(wsReconnectTimeout);
+            }
+        });
     </script>
 </body>
 </html>
